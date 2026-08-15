@@ -215,6 +215,14 @@ impl Lang {
             Lang::En => "Re-synced (API fallback)",
         }
     }
+
+    /// 构建结果：快速路径，版本一致复用已有构建产物跳过构建。
+    pub fn detail_build_cached(self) -> &'static str {
+        match self {
+            Lang::Zh => "版本一致，复用已有构建产物，跳过构建",
+            Lang::En => "Version matches, reusing existing build, skipping build",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -273,6 +281,8 @@ mod tests {
         assert!(Lang::En.detail_prepare_node().contains("Preparing Node"));
         assert!(Lang::Zh.detail_sync_cached().contains("版本一致"));
         assert!(Lang::En.detail_sync_cached().contains("Version matches"));
+        assert!(Lang::Zh.detail_build_cached().contains("版本一致"));
+        assert!(Lang::En.detail_build_cached().contains("Version matches"));
     }
 
     /// 中英文文案互不相同

@@ -227,28 +227,44 @@ fn run_bootstrap(
     send_status("repo", "done", sync_result_detail(&sync, lang));
 
     // ---- 安装依赖 + 构建 ----
-    send_status("install", "running", lang.detail_installing().to_string());
-    let build_result = builder::run_build(
-        &node_paths,
-        &sync.repo_dir,
-        &cfg.build_script,
-        &cfg.install_args,
-        &workspace_root,
-        &|phase: &str| {
-            // install → build 阶段切换：install 完成标记 done
-            if phase == "build" {
+    // 快速路径：同步未更新（updated=false）说明远端 commit 与本地一致，
+    // 此时若已有构建产物则直接复用，跳过 pnpm install + build，加快二次启动。
+    // 复用失败（无 dist）或确实发生更新时，回退到完整安装 + 构建流程。
+    // dist_dir 在同一代码块内确定，供后续宿主启动与 Ready 事件复用同一变量。
+    let dist_dir = 'build: {
+        if !sync.updated {
+            if let Ok(existing_dist) = builder::locate_dist_dir(&sync.repo_dir) {
                 send_status("install", "done", lang.detail_install_done().to_string());
-                send_status("build", "running", lang.detail_building().to_string());
+                send_status("build", "done", lang.detail_build_cached().to_string());
+                break 'build existing_dist;
             }
-        },
-        &|line: String| send_log(line),
-    );
+        }
 
-    let dist_dir = build_result.map_err(|e| {
-        send_status("build", "failed", format!("{e:#}"));
-        e
-    })?;
-    send_status("build", "done", lang.detail_build_done().to_string());
+        // 完整安装 + 构建流程（含快速路径未命中时的回退）
+        send_status("install", "running", lang.detail_installing().to_string());
+        let build_result = builder::run_build(
+            &node_paths,
+            &sync.repo_dir,
+            &cfg.build_script,
+            &cfg.install_args,
+            &workspace_root,
+            &|phase: &str| {
+                // install → build 阶段切换：install 完成标记 done
+                if phase == "build" {
+                    send_status("install", "done", lang.detail_install_done().to_string());
+                    send_status("build", "running", lang.detail_building().to_string());
+                }
+            },
+            &|line: String| send_log(line),
+        );
+
+        let built = build_result.map_err(|e| {
+            send_status("build", "failed", format!("{e:#}"));
+            e
+        })?;
+        send_status("build", "done", lang.detail_build_done().to_string());
+        built
+    };
     let _ = proxy.send_event(UserEvent::Ready(dist_dir));
 
     // ---- dsh web 宿主启动 ----

@@ -273,6 +273,10 @@ fn build_args_for(pm: PackageManager, script: &str) -> Vec<String> {
 
 /// 定位构建产物目录（含 `index.html` 的静态站点根）。
 ///
+/// 除构建后定位产物外，也用于"版本一致复用已有产物"判断：
+/// 当同步走快速路径（`updated=false`）且本地已有产物时，直接复用该目录，
+/// 从而跳过安装与构建。因此本函数需保持公有可见，供 `main.rs` 复用判断。
+///
 /// 搜索顺序（均排除 node_modules）：
 /// 1. `<repo>/dist`（普通单包仓库约定）
 /// 2. `<repo>/apps/<any>/dist`（monorepo 子包，如 deepseek-harness 的 apps/web）
@@ -285,7 +289,7 @@ fn build_args_for(pm: PackageManager, script: &str) -> Vec<String> {
 ///
 /// # Errors
 /// 所有候选位置均无 `index.html` 时返回错误
-fn locate_dist_dir(repo_dir: &Path) -> anyhow::Result<PathBuf> {
+pub fn locate_dist_dir(repo_dir: &Path) -> anyhow::Result<PathBuf> {
     // 候选 1：仓库根 dist
     let root_dist = repo_dir.join(DIST_DIR_NAME);
     if root_dist.join("index.html").is_file() {
