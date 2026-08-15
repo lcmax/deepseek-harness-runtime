@@ -115,9 +115,10 @@ cargo build --release
 # 单文件二进制，无需额外依赖
 ```
 
-<img width="1182" height="832" alt="ScreenShot_2026-08-15_112445_136" src="https://github.com/user-attachments/assets/65655234-cdfe-4e32-896e-56ce92ebe7bd" />
-<img width="1182" height="832" alt="ScreenShot_2026-08-15_112457_321" src="https://github.com/user-attachments/assets/783972cd-a87d-4736-a7a1-35b71c6fdc22" />
 
+<img width="1182" height="832" alt="ScreenShot_2026-08-15_112445_136" src="https://github.com/user-attachments/assets/63c6e5f7-4c29-4789-be65-63df26252802" />
+
+<img width="1182" height="832" alt="ScreenShot_2026-08-15_112457_321" src="https://github.com/user-attachments/assets/73af2ac0-0c0a-4797-9f03-4c95a0052f4c" />
 
 
 ## 🛠️ 技术栈
