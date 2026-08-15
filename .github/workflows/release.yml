@@ -105,13 +105,15 @@ jobs:
           mkdir -p dist
           cp "$BIN_SRC" "dist/${BINARY}"
 
-          # Windows 需附带 WebView2Loader.dll（wry 构建生成，兜底从仓库根目录复制）
+          # Windows 需附带与 webview2-com-sys 0.38.2 捆绑版本一致的 WebView2Loader.dll
+          # （x86_64 目标取 x64）。从官方 NuGet 包提取，避免 wry 构建产物缺失或架构错误。
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            if [ -f "target/${{ matrix.target }}/release/WebView2Loader.dll" ]; then
-              cp "target/${{ matrix.target }}/release/WebView2Loader.dll" "dist/WebView2Loader.dll"
-            elif [ -f "WebView2Loader.dll" ]; then
-              cp "WebView2Loader.dll" "dist/WebView2Loader.dll"
-            fi
+            WEBVIEW2_VERSION="1.0.3650.58"
+            NUGET="Microsoft.Web.WebView2.${WEBVIEW2_VERSION}.nupkg"
+            curl -sSL -o "$NUGET" "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/${WEBVIEW2_VERSION}"
+            unzip -o "$NUGET" -d webview2-pkg > /dev/null
+            cp "webview2-pkg/runtimes/win-x64/native/WebView2Loader.dll" "dist/WebView2Loader.dll"
+            rm -rf webview2-pkg "$NUGET"
           fi
 
           if [ "$PKG" = "zip" ]; then
