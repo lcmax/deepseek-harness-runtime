@@ -31,7 +31,13 @@ jobs:
         id: v
         shell: bash
         run: |
-          VER=$(grep -m1 '^version' Cargo.toml | sed 's/.*="\(.*\)"/\1/')
+          # 仅解析 [package] 段内的 version 字段，避免误匹配依赖项
+          VER=$(awk '/^\[package\]/ {p=1; next} /^\[/ {p=0} p && /^version[[:space:]]*=/ {gsub(/"/,"",$3); print $3; exit}' Cargo.toml)
+          echo "Parsed version: $VER"
+          if [ -z "$VER" ]; then
+            echo "::error::Failed to parse version from Cargo.toml"
+            exit 1
+          fi
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           echo "tag=v$VER" >> "$GITHUB_OUTPUT"
 
