@@ -132,6 +132,10 @@ cargo build --release
 | HTTP | [reqwest](https://crates.io/crates/reqwest) | 下载与同步 |
 | 监听 | [notify](https://crates.io/crates/notify) | 文件变更检测 |
 
+## 🙏 致谢
+
+本项目基于 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 构建，并作为其桌面运行时。我们衷心感谢 [DeepSeek](https://www.deepseek.com/) 的开源贡献与卓越的 AI 模型，让本项目得以落地。
+
 ## 📄 许可证
 
 本项目基于 MIT 许可证开源。详情见 [LICENSE](./LICENSE)。

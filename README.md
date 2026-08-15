@@ -131,6 +131,10 @@ cargo build --release
 | HTTP | [reqwest](https://crates.io/crates/reqwest) | Download & sync |
 | Watcher | [notify](https://crates.io/crates/notify) | File change detection |
 
+## 🙏 Acknowledgement
+
+This project is built on top of [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) and serves as its desktop runtime. We sincerely thank [DeepSeek](https://www.deepseek.com/) for their open-source contributions and outstanding AI models that made this project possible.
+
 ## 📄 License
 
 This project is licensed under the MIT License. See [LICENSE](./LICENSE) for details.
