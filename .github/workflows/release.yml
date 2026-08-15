@@ -99,11 +99,13 @@ jobs:
           VER="${{ needs.version.outputs.version }}"
           ASSET="${{ matrix.asset }}"
           PKG="${{ matrix.pkg }}"
-          BIN_SRC="target/${{ matrix.target }}/release/${BINARY}${{ matrix.ext }}"
+          EXT="${{ matrix.ext }}"
+          BIN_SRC="target/${{ matrix.target }}/release/${BINARY}${EXT}"
           OUT_BASENAME="${BINARY}-${VER}-${ASSET}"
 
           mkdir -p dist
-          cp "$BIN_SRC" "dist/${BINARY}"
+          # 保留原扩展名（Windows 为 .exe），避免发布包内可执行文件丢失后缀
+          cp "$BIN_SRC" "dist/${BINARY}${EXT}"
 
           # Windows 需附带与 webview2-com-sys 0.38.2 捆绑版本一致的 WebView2Loader.dll
           # （x86_64 目标取 x64）。从官方 NuGet 包提取，避免 wry 构建产物缺失或架构错误。

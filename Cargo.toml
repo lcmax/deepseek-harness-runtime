@@ -1,6 +1,6 @@
 [package]
 name = "rustc-deepseek-harness"
-version = "0.26.8-15.5"
+version = "0.26.8-15.6"
 edition = "2021"
 build = "build.rs"
 
