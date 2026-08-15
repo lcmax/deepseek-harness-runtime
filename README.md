@@ -115,9 +115,9 @@ cargo build --release
 # Single binary, no extra dependencies
 ```
 
-<img width="1182" height="832" alt="ScreenShot_2026-08-15_112445_136" src="https://github.com/user-attachments/assets/2e062601-0397-46e0-ba4c-9c35b9d8baf0" />
+<img width="1182" height="832" alt="ScreenShot_2026-08-15_112445_136" src="https://github.com/user-attachments/assets/63c6e5f7-4c29-4789-be65-63df26252802" />
 
-<img width="1182" height="832" alt="ScreenShot_2026-08-15_112457_321" src="https://github.com/user-attachments/assets/0e8ae02e-31dd-4676-b381-6754f3e67396" />
+<img width="1182" height="832" alt="ScreenShot_2026-08-15_112457_321" src="https://github.com/user-attachments/assets/73af2ac0-0c0a-4797-9f03-4c95a0052f4c" />
 
 
 ## 🛠️ Technical Stack
