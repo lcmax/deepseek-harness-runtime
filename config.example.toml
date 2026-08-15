@@ -1,0 +1,21 @@
+# rustc-deepseek-harness 运行时示例配置
+# 复制为 config.toml 后生效；未提供的字段使用默认值
+
+[app]
+# 拉取的 GitHub 仓库（仅支持 github.com，纯 HTTP 拉取，无需本地 git）
+repo_url = "https://github.com/deepseek-ai/deepseek-harness.git"
+branch = "master"
+
+[node]
+# Node.js 版本（默认 24.19.0，可覆盖；运行时自动下载托管，不依赖系统 PATH）
+version = "24.19.0"
+
+[workspace]
+# 运行时工作目录：node/、repo/、state.json 都放在这里
+root = ".runtime"
+
+[build]
+# npm run <script>（要求仓库 package.json 存在该脚本）
+script = "build"
+# 附加到 npm install 的额外参数，例如 ["--registry=https://registry.npmmirror.com"]
+install_args = []

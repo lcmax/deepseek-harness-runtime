@@ -1,0 +1,133 @@
+# 跨平台发布工作流
+#
+# 构建并发布 Windows / Linux / macOS(仅 arm64) 三个平台的产物，
+# 并以 GitHub Release 形式发布。触发方式：
+#   1. 推送形如 `v*` 的 tag；
+#   2. 手动触发 workflow_dispatch。
+#
+# 版本号从 Cargo.toml 的 `version` 字段自动读取，tag 格式为 `v{version}`。
+
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  BINARY: rustc-deepseek-harness
+
+jobs:
+  # 解析 Cargo.toml 中的版本号，供其余 job 复用
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 读取版本号
+        id: v
+        shell: bash
+        run: |
+          VER=$(grep -m1 '^version' Cargo.toml | sed 's/.*="\(.*\)"/\1/')
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VER" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: .exe
+            asset: windows-x86_64
+            pkg: zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+            asset: linux-x86_64
+            pkg: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            ext: ""
+            asset: macos-aarch64
+            pkg: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 缓存编译产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: 编译 release 版本
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: 打包发布产物
+        id: package
+        shell: bash
+        run: |
+          set -e
+          VER="${{ needs.version.outputs.version }}"
+          ASSET="${{ matrix.asset }}"
+          PKG="${{ matrix.pkg }}"
+          BIN_SRC="target/${{ matrix.target }}/release/${BINARY}${{ matrix.ext }}"
+          OUT_BASENAME="${BINARY}-${VER}-${ASSET}"
+
+          mkdir -p dist
+          cp "$BIN_SRC" "dist/${BINARY}"
+
+          # Windows 需附带 WebView2Loader.dll（wry 构建生成，兜底从仓库根目录复制）
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            if [ -f "target/${{ matrix.target }}/release/WebView2Loader.dll" ]; then
+              cp "target/${{ matrix.target }}/release/WebView2Loader.dll" "dist/WebView2Loader.dll"
+            elif [ -f "WebView2Loader.dll" ]; then
+              cp "WebView2Loader.dll" "dist/WebView2Loader.dll"
+            fi
+          fi
+
+          if [ "$PKG" = "zip" ]; then
+            powershell -NoProfile -Command "Compress-Archive -Path dist/* -DestinationPath '${OUT_BASENAME}.zip' -Force"
+          else
+            tar -czf "${OUT_BASENAME}.tar.gz" -C dist .
+          fi
+
+          echo "artifact=${OUT_BASENAME}.${PKG}" >> "$GITHUB_OUTPUT"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ steps.package.outputs.artifact }}
+          if-no-files-found: error
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 下载全部构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.tag }}
+          body: |
+            当前版本发布包（Windows / Linux / macOS arm64）。
+          files: artifacts/**/*
+          generate_release_notes: true

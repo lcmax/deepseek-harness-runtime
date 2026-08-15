@@ -1,0 +1,27 @@
+# Build outputs
+/target
+/debug
+/release
+
+# Root-level build artifacts
+rustc-deepseek-harness.exe
+WebView2Loader.dll
+
+# Runtime data
+/.runtime/
+/.trae/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Node (managed by runtime)
+node_modules/
