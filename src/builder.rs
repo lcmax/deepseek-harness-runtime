@@ -76,6 +76,7 @@ fn run_tool_command(
     repo_dir: &Path,
     node_paths: &NodePaths,
     workspace_root: &Path,
+    extra_env: &[(String, String)],
     on_log: &(dyn Fn(String) + Send + Sync),
 ) -> anyhow::Result<()> {
     on_log(format!("$ {} {}", exe_path.file_name().unwrap_or_default().to_string_lossy(), args.join(" ")));
@@ -83,6 +84,9 @@ fn run_tool_command(
     let mut command = build_command(exe_path, args);
     command.current_dir(repo_dir);
     inject_environment(&mut command, node_paths, workspace_root);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
 
     let mut child = command
         .stdout(std::process::Stdio::piped())
@@ -235,26 +239,35 @@ fn collect_stream<R: std::io::Read>(
 
 /// 按包管理器生成依赖安装参数序列。
 ///
+/// * 托管 pnpm（`pnpm_cmd` 提供）：`node <pnpm.cjs> install --config.store-dir=... ...`
+/// * corepack 代理 pnpm：`corepack pnpm install --config.store-dir=... ...`
+/// * npm：`npm install ...`
+///
 /// pnpm 额外注入 `--config.store-dir`：pnpm 默认 store 在盘根 `<盘>/.pnpm-store`，
 /// 常因无写权限失败；CLI 参数优先级最高，稳定生效。
 ///
 /// # Arguments
 /// * `pm` - 包管理器类型
+/// * `pnpm_cmd` - 托管 pnpm 入口（`pnpm.cjs`），仅 pnpm 类型且已托管时传 `Some`
 /// * `install_args` - 用户配置的附加参数（registry 等，npm/pnpm 均兼容）
 /// * `workspace_root` - 运行时工作目录（pnpm store 落点）
-fn install_args_for(pm: PackageManager, install_args: &[String], workspace_root: &Path) -> Vec<String> {
-    let mut argv: Vec<String> = match pm {
-        // corepack 代理调用：corepack pnpm install --config.store-dir=... ...
-        PackageManager::Pnpm => vec![
-            "pnpm".into(),
-            "install".into(),
-            format!(
+fn install_args_for(
+    pm: PackageManager,
+    pnpm_cmd: Option<&Path>,
+    install_args: &[String],
+    workspace_root: &Path,
+) -> Vec<String> {
+    let mut argv = prefix_argv_for(pm, pnpm_cmd);
+    match pm {
+        PackageManager::Pnpm => {
+            argv.push("install".into());
+            argv.push(format!(
                 "--config.store-dir={}",
                 workspace_root.join("pnpm-store").display()
-            ),
-        ],
-        PackageManager::Npm => vec!["install".into()],
-    };
+            ));
+        }
+        PackageManager::Npm => argv.push("install".into()),
+    }
     argv.extend_from_slice(install_args);
     argv
 }
@@ -263,11 +276,31 @@ fn install_args_for(pm: PackageManager, install_args: &[String], workspace_root:
 ///
 /// # Arguments
 /// * `pm` - 包管理器类型
+/// * `pnpm_cmd` - 托管 pnpm 入口（`pnpm.cjs`），仅 pnpm 类型且已托管时传 `Some`
 /// * `script` - `run <script>` 脚本名
-fn build_args_for(pm: PackageManager, script: &str) -> Vec<String> {
+fn build_args_for(pm: PackageManager, pnpm_cmd: Option<&Path>, script: &str) -> Vec<String> {
+    let mut argv = prefix_argv_for(pm, pnpm_cmd);
+    argv.push("run".into());
+    argv.push(script.into());
+    argv
+}
+
+/// 生成工具前缀参数：决定实际调用的是哪个可执行命令。
+///
+/// - pnpm + 托管：`[<pnpm.cjs 绝对路径>]`（经 `node <入口>` 启动）
+/// - pnpm + 未托管：`["pnpm"]`（经 corepack 代理）
+/// - npm：`[]`
+///
+/// # Arguments
+/// * `pm` - 包管理器类型
+/// * `pnpm_cmd` - 托管 pnpm 入口（`pnpm.cjs`）
+fn prefix_argv_for(pm: PackageManager, pnpm_cmd: Option<&Path>) -> Vec<String> {
     match pm {
-        PackageManager::Pnpm => vec!["pnpm".into(), "run".into(), script.to_string()],
-        PackageManager::Npm => vec!["run".into(), script.to_string()],
+        PackageManager::Pnpm => match pnpm_cmd {
+            Some(cmd) => vec![cmd.display().to_string()],
+            None => vec!["pnpm".to_string()],
+        },
+        PackageManager::Npm => vec![],
     }
 }
 
@@ -319,8 +352,8 @@ pub fn locate_dist_dir(repo_dir: &Path) -> anyhow::Result<PathBuf> {
 
 /// 执行完整构建流程：依赖安装 → 构建脚本。
 ///
-/// pnpm 仓库经 corepack 执行（自动按 packageManager 字段获取对应 pnpm 版本）；
-/// 普通仓库直接用托管 npm。
+/// pnpm 仓库经托管 pnpm（配置指定版本）或 corepack 执行（按 packageManager 字段
+/// 自动获取对应 pnpm 版本）；普通仓库直接用托管 npm。
 ///
 /// # Arguments
 /// * `node_paths` - 托管 Node 工具链（npm 入口 / corepack 入口 / bin 目录）
@@ -328,8 +361,10 @@ pub fn locate_dist_dir(repo_dir: &Path) -> anyhow::Result<PathBuf> {
 /// * `script` - `run <script>` 构建脚本名
 /// * `install_args` - 附加到安装命令的参数
 /// * `workspace_root` - 运行时工作目录（缓存隔离落点）
+/// * `pnpm_cmd` - 托管 pnpm 入口（`bin/pnpm.cjs` 绝对路径）；`None` 表示用 corepack
 /// * `on_phase` - 阶段切换回调（依次收到 `"install"`、`"build"`）
 /// * `on_log` - 流式日志回调（含阶段标题行；须 Send + Sync）
+/// * `on_progress` - 进度回调：百分比（`None` 表示不确定）与展示文案
 ///
 /// # Returns
 /// 构建产物目录 `repo/dist`（约定构建输出目录）
@@ -337,14 +372,19 @@ pub fn locate_dist_dir(repo_dir: &Path) -> anyhow::Result<PathBuf> {
 /// # Errors
 /// - install 或 build 任一命令非 0 退出
 /// - 构建成功但 dist/ 不存在
+#[allow(clippy::too_many_arguments)]
 pub fn run_build(
     node_paths: &NodePaths,
     repo_dir: &Path,
     script: &str,
     install_args: &[String],
     workspace_root: &Path,
+    pnpm_cmd: Option<&Path>,
+    lang: crate::i18n::Lang,
+    commit_hash: Option<&str>,
     on_phase: &dyn Fn(&str),
     on_log: &(dyn Fn(String) + Send + Sync),
+    on_progress: &(dyn Fn(Option<f64>, Option<String>) + Send + Sync),
 ) -> anyhow::Result<PathBuf> {
     // 容器隔离前提：确保 <workspace>/npmrc 存在并注入 NPM_CONFIG_USERCONFIG
     ensure_isolated_npmrc(workspace_root)?;
@@ -356,36 +396,66 @@ pub fn run_build(
     } else {
         node_paths.bin_dir.join("corepack")
     };
-    // pnpm 经 corepack 代理执行；npm 直接执行
+    // 工具入口：pnpm 已托管时用托管 node 直接启动 pnpm.cjs；否则 corepack/npm
     let tool = match pm {
+        PackageManager::Pnpm if pnpm_cmd.is_some() => node_paths.node.clone(),
         PackageManager::Pnpm => corepack,
         PackageManager::Npm => node_paths.npm.clone(),
     };
 
-    // 阶段一：安装依赖
+    // 阶段一：安装依赖（行数 → 进度文案）
     on_phase("install");
     run_tool_command(
         &tool,
-        &install_args_for(pm, install_args, workspace_root),
+        &install_args_for(pm, pnpm_cmd, install_args, workspace_root),
         repo_dir,
         node_paths,
         workspace_root,
-        on_log,
+        &[],
+        &line_meter_log(lang, on_log, on_progress),
     )?;
+    on_progress(Some(1.0), Some(lang.progress_install_done().to_string()));
 
     // 阶段二：执行构建脚本
+    // 注入 DSH_CLIENT_COMMIT_HASH：仓库经 zip 下载无 .git，构建脚本无法
+    // `git rev-parse HEAD`；用同步时获取的 commit SHA 覆盖（见 client-build-environment.ts）
+    let build_env: Vec<(String, String)> = commit_hash
+        .map(|h| vec![("DSH_CLIENT_COMMIT_HASH".to_string(), h.to_string())])
+        .unwrap_or_default();
     on_phase("build");
     run_tool_command(
         &tool,
-        &build_args_for(pm, script),
+        &build_args_for(pm, pnpm_cmd, script),
         repo_dir,
         node_paths,
         workspace_root,
-        on_log,
+        &build_env,
+        &line_meter_log(lang, on_log, on_progress),
     )?;
+    on_progress(Some(1.0), Some(lang.progress_build_done().to_string()));
 
     let dist_dir = locate_dist_dir(repo_dir)?;
     Ok(dist_dir)
+}
+
+/// 包装日志回调：逐行转发的同时统计行数，把「已输出 N 行」作为不确定进度文案
+/// 回调给 `on_progress`（install/build 阶段无法精确获得百分比，用活动进度提示）。
+///
+/// # Arguments
+/// * `lang` - 展示文案语言
+/// * `on_log` - 原始日志回调
+/// * `on_progress` - 进度回调（百分比传 `None` 表示不确定）
+fn line_meter_log<'a>(
+    lang: crate::i18n::Lang,
+    on_log: &'a (dyn Fn(String) + Send + Sync),
+    on_progress: &'a (dyn Fn(Option<f64>, Option<String>) + Send + Sync),
+) -> impl Fn(String) + Send + Sync + 'a {
+    let lines = std::sync::atomic::AtomicU64::new(0);
+    move |line: String| {
+        let n = lines.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        on_log(line);
+        on_progress(None, Some(lang.progress_lines(n)));
+    }
 }
 
 #[cfg(test)]
@@ -520,18 +590,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
-    /// 命令参数生成正确
+    /// 命令参数生成正确（含托管 pnpm 前缀）
     #[test]
     fn test_args_generation() {
         let extra = vec!["--registry=https://example.com".to_string()];
         let ws = Path::new("/ws");
+        let pnpm = Path::new("/ws/pnpm/pnpm-10.9.1/bin/pnpm.cjs");
 
-        let npm_install = install_args_for(PackageManager::Npm, &extra, ws);
+        // npm：无前缀，直接 install
+        let npm_install = install_args_for(PackageManager::Npm, None, &extra, ws);
         assert_eq!(npm_install, vec!["install", "--registry=https://example.com"]);
 
-        let pnpm_install = install_args_for(PackageManager::Pnpm, &extra, ws);
+        // pnpm + corepack 代理：前缀 ["pnpm"]
+        let pnpm_corepack = install_args_for(PackageManager::Pnpm, None, &extra, ws);
         assert_eq!(
-            pnpm_install,
+            pnpm_corepack,
             vec![
                 "pnpm",
                 "install",
@@ -540,13 +613,29 @@ mod tests {
             ]
         );
 
+        // pnpm + 托管：前缀为 pnpm.cjs 路径（经 node 启动）
+        let pnpm_managed = install_args_for(PackageManager::Pnpm, Some(pnpm), &extra, ws);
         assert_eq!(
-            build_args_for(PackageManager::Npm, "build"),
+            pnpm_managed,
+            vec![
+                pnpm.display().to_string(),
+                "install".to_string(),
+                format!("--config.store-dir={}", ws.join("pnpm-store").display()),
+                "--registry=https://example.com".to_string()
+            ]
+        );
+
+        assert_eq!(
+            build_args_for(PackageManager::Npm, None, "build"),
             vec!["run", "build"]
         );
         assert_eq!(
-            build_args_for(PackageManager::Pnpm, "build"),
+            build_args_for(PackageManager::Pnpm, None, "build"),
             vec!["pnpm", "run", "build"]
+        );
+        assert_eq!(
+            build_args_for(PackageManager::Pnpm, Some(pnpm), "build"),
+            vec![pnpm.display().to_string(), "run".to_string(), "build".to_string()]
         );
     }
 }

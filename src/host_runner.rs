@@ -97,7 +97,7 @@ pub fn spawn_web_host(
         .map_err(|e| anyhow::anyhow!("创建 dsh-home 失败: {e}"))?;
 
     send_log(format!(
-        "$ node apps/cli/lib/bin.js web --port 0  (DSH_HOME={})",
+        "$ node apps/cli/lib/bin.js web --port 0 --no-open  (DSH_HOME={})",
         dsh_home.display()
     ));
 
@@ -107,6 +107,7 @@ pub fn spawn_web_host(
         .arg("web")
         .arg("--port")
         .arg("0")
+        .arg("--no-open")
         .current_dir(repo_dir)
         .env("DSH_HOME", &dsh_home)
         .stdout(std::process::Stdio::piped())

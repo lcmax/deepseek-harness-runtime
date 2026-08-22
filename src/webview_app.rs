@@ -256,6 +256,23 @@ pub fn status_page_html(lang: Lang) -> String {
   .stage.failed  .dot {{ background: #e74c3c; }}
   .stage .name {{ font-weight: 600; min-width: 140px; }}
   .stage .detail {{ color: #9aa0b0; font-size: 13px; flex: 1; }}
+  .progress {{
+    width: 160px; height: 4px; border-radius: 2px;
+    background: #262a36; overflow: hidden; flex: none;
+    visibility: hidden; margin-left: 12px;
+  }}
+  .progress.show {{ visibility: visible; }}
+  .progress i {{
+    display: block; height: 100%; border-radius: 2px;
+    background: #4f8cff; width: 0%; transition: width .2s ease;
+  }}
+  .progress.indet i {{
+    width: 40%; animation: slide 1.1s ease-in-out infinite;
+  }}
+  @keyframes slide {{
+    0%   {{ margin-left: -40%; }}
+    100% {{ margin-left: 100%; }}
+  }}
   @keyframes pulse {{ from {{ opacity: .4; }} to {{ opacity: 1; }} }}
   pre#log {{
     margin-top: 24px; padding: 14px; max-height: 320px; overflow: auto;
@@ -267,11 +284,11 @@ pub fn status_page_html(lang: Lang) -> String {
 <body>
 <h1>{}</h1>
 <div class="stages">
-  <div class="stage pending" id="stage-node"><span class="dot"></span><span class="name">{}</span><span class="detail">{}</span></div>
-  <div class="stage pending" id="stage-repo"><span class="dot"></span><span class="name">{}</span><span class="detail">{}</span></div>
-  <div class="stage pending" id="stage-install"><span class="dot"></span><span class="name">{}</span><span class="detail">{}</span></div>
-  <div class="stage pending" id="stage-build"><span class="dot"></span><span class="name">{}</span><span class="detail">{}</span></div>
-  <div class="stage pending" id="stage-host"><span class="dot"></span><span class="name">{}</span><span class="detail">{}</span></div>
+  <div class="stage pending" id="stage-node"><span class="dot"></span><span class="name">{}</span><span class="detail">{}</span><div class="progress" id="wrap-node"><i id="bar-node"></i></div></div>
+  <div class="stage pending" id="stage-repo"><span class="dot"></span><span class="name">{}</span><span class="detail">{}</span><div class="progress" id="wrap-repo"><i id="bar-repo"></i></div></div>
+  <div class="stage pending" id="stage-install"><span class="dot"></span><span class="name">{}</span><span class="detail">{}</span><div class="progress" id="wrap-install"><i id="bar-install"></i></div></div>
+  <div class="stage pending" id="stage-build"><span class="dot"></span><span class="name">{}</span><span class="detail">{}</span><div class="progress" id="wrap-build"><i id="bar-build"></i></div></div>
+  <div class="stage pending" id="stage-host"><span class="dot"></span><span class="name">{}</span><span class="detail">{}</span><div class="progress" id="wrap-host"><i id="bar-host"></i></div></div>
 </div>
 <pre id="log"></pre>
 <script>
@@ -280,6 +297,25 @@ pub fn status_page_html(lang: Lang) -> String {
     if (!el) return;
     el.className = 'stage ' + state;
     el.querySelector('.detail').textContent = detail;
+  }};
+  // value: -1 不确定（滑动动画）| 0..1 精确百分比 | null/undefined 隐藏
+  window.dshSetProgress = function (stage, value, detail) {{
+    var bar = document.getElementById('bar-' + stage);
+    if (!bar) return;
+    var wrap = bar.parentNode;
+    var detailEl = bar.closest('.stage').querySelector('.detail');
+    if (detail) detailEl.textContent = detail;
+    if (value === null || value === undefined) {{
+      wrap.classList.remove('show');
+      return;
+    }}
+    wrap.classList.add('show');
+    if (value < 0) {{
+      wrap.classList.add('indet');
+      return;
+    }}
+    wrap.classList.remove('indet');
+    bar.style.width = (value * 100) + '%';
   }};
   window.dshLog = function (line) {{
     var log = document.getElementById('log');
@@ -328,6 +364,24 @@ pub fn eval_log(line: &str) -> String {
     format!(
         "window.dshLog && dshLog({});",
         serde_json::json!(line)
+    )
+}
+
+/// 生成安全的 eval 片段：更新阶段进度条。
+///
+/// # Arguments
+/// * `stage` - 阶段 id（node/repo/install/build/host）
+/// * `progress` - `Some(p)` 精确百分比（0.0~1.0）；`None` 表示不确定（滑动动画）
+/// * `detail` - 进度文案（如"下载中 32% …"），可传 `None` 保持原文案
+pub fn eval_progress(stage: &str, progress: Option<f64>, detail: Option<&str>) -> String {
+    let value = progress
+        .map(|p| p.clamp(0.0, 1.0))
+        .unwrap_or(-1.0);
+    format!(
+        "window.dshSetProgress && dshSetProgress({}, {}, {});",
+        serde_json::json!(stage),
+        serde_json::json!(value),
+        serde_json::json!(detail)
     )
 }
 
@@ -394,6 +448,31 @@ mod tests {
 
         let l = eval_log("line'with\\quotes");
         assert!(l.contains("dshLog"));
+
+        // 精确进度
+        let p = eval_progress("repo", Some(0.5), Some("下载中 50%"));
+        assert!(p.contains("dshSetProgress"));
+        assert!(p.contains("0.5"));
+        assert!(p.contains("下载中 50%"));
+
+        // 不确定进度（None → -1）
+        let indet = eval_progress("install", None, None);
+        assert!(indet.contains("-1"));
+
+        // 无文案
+        let no_detail = eval_progress("build", Some(1.0), None);
+        assert!(no_detail.contains("null"));
+    }
+
+    /// 状态页 HTML 包含进度条容器（每阶段一个）
+    #[test]
+    fn test_status_page_has_progress_bars() {
+        let html = status_page_html(Lang::Zh);
+        assert!(html.contains("id=\"bar-node\""));
+        assert!(html.contains("id=\"bar-repo\""));
+        assert!(html.contains("id=\"bar-install\""));
+        assert!(html.contains("id=\"bar-build\""));
+        assert!(html.contains("dshSetProgress"));
     }
 
     /// 状态页中文文案与 lang 属性

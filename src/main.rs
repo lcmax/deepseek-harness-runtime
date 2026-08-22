@@ -23,6 +23,7 @@ mod watcher;
 mod webview_app;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -43,12 +44,21 @@ enum UserEvent {
         /// 展示文案
         detail: String,
     },
+    /// 阶段进度条更新（stage: repo/install/build；progress: 0.0~1.0 或 None 不确定）
+    Progress {
+        /// 阶段标识
+        stage: &'static str,
+        /// 进度值（`None` 表示不确定，前端显示滑动动画）
+        progress: Option<f64>,
+        /// 进度文案（如"下载中 32% …"）
+        detail: Option<String>,
+    },
     /// 流式日志行（构建输出等）
     Log(String),
     /// 构建就绪，携带 dist 目录绝对路径
     Ready(PathBuf),
-    /// dsh web 宿主就绪，携带实际服务 URL（http://127.0.0.1:<port>）
-    HostReady(String),
+    /// dsh web 宿主就绪，携带实际服务 URL（http://127.0.0.1:<port>）与版本标签
+    HostReady { url: String, version_label: String },
     /// dist 产物变化，触发 webview 刷新
     Reload,
 }
@@ -132,6 +142,13 @@ fn handle_user_event(
             println!("[{stage}] {state}: {detail}");
             let _ = webview.evaluate_script(&webview_app::eval_set_stage(stage, state, &detail));
         }
+        UserEvent::Progress { stage, progress, detail } => {
+            let _ = webview.evaluate_script(&webview_app::eval_progress(
+                stage,
+                progress,
+                detail.as_deref(),
+            ));
+        }
         UserEvent::Log(line) => {
             println!("{line}");
             let _ = webview.evaluate_script(&webview_app::eval_log(&line));
@@ -146,10 +163,10 @@ fn handle_user_event(
                 eprintln!("启动 dist 监听失败: {e}");
             }
         }
-        UserEvent::HostReady(url) => {
+        UserEvent::HostReady { url, version_label } => {
             // 宿主就绪：加载完整 Web GUI（宿主注入 __DSH_BOOT__ 并服务 API）
             println!("dsh web 宿主就绪: {url}");
-            window.set_title("DeepSeek Harness Runtime");
+            window.set_title(&format!("DeepSeek Harness Runtime - {version_label}"));
             if let Err(e) = webview.load_url(&url) {
                 eprintln!("加载宿主 URL 失败: {e:?}");
             }
@@ -202,12 +219,41 @@ fn run_bootstrap(
         &|msg: String| {
             let _ = proxy.send_event(UserEvent::Log(msg));
         },
+        &|written: u64, total: Option<u64>| {
+            let (progress, detail) = download_progress_detail(lang, written, total);
+            let _ = proxy.send_event(UserEvent::Progress {
+                stage: "node",
+                progress,
+                detail,
+            });
+        },
     )
     .map_err(|e| {
         send_status("node", "failed", format!("{e:#}"));
         e
     })?;
     send_status("node", "done", lang.detail_node_ready().replace("{}", &cfg.node_version));
+
+    // ---- 托管 pnpm（可选：配置指定版本时在容器内托管对应版本 pnpm）----
+    let pnpm_cmd = node_manager::ensure_pnpm(
+        &workspace_root,
+        cfg.pnpm_version.as_deref(),
+        &|msg: String| {
+            let _ = proxy.send_event(UserEvent::Log(msg));
+        },
+        &|written: u64, total: Option<u64>| {
+            let (progress, detail) = download_progress_detail(lang, written, total);
+            let _ = proxy.send_event(UserEvent::Progress {
+                stage: "node",
+                progress,
+                detail,
+            });
+        },
+    )
+    .map_err(|e| {
+        send_status("node", "failed", format!("{e:#}"));
+        e
+    })?;
 
     // ---- 仓库增量同步 ----
     send_status("repo", "running", lang.detail_check_remote().to_string());
@@ -216,8 +262,16 @@ fn run_bootstrap(
         &cfg.repo_url,
         &cfg.branch,
         &cfg.node_version,
+        lang,
         &|msg: String| {
             let _ = proxy.send_event(UserEvent::Log(msg));
+        },
+        &|progress: Option<f64>, detail: Option<String>| {
+            let _ = proxy.send_event(UserEvent::Progress {
+                stage: "repo",
+                progress,
+                detail,
+            });
         },
     )
     .map_err(|e| {
@@ -232,6 +286,7 @@ fn run_bootstrap(
     // 复用失败（无 dist）或确实发生更新时，回退到完整安装 + 构建流程。
     // dist_dir 在同一代码块内确定，供后续宿主启动与 Ready 事件复用同一变量。
     let dist_dir = 'build: {
+        // 快速路径：仓库未更新 + 构建产物已就绪 → 跳过 install + build
         if !sync.updated {
             if let Ok(existing_dist) = builder::locate_dist_dir(&sync.repo_dir) {
                 send_status("install", "done", lang.detail_install_done().to_string());
@@ -242,26 +297,49 @@ fn run_bootstrap(
 
         // 完整安装 + 构建流程（含快速路径未命中时的回退）
         send_status("install", "running", lang.detail_installing().to_string());
+        // install/build 两阶段共享同一 progress 事件，用原子标志记录当前阶段
+        // （0 = install，1 = build；闭包需要 Send+Sync，故不用 Cell）
+        let build_stage = AtomicU8::new(0);
         let build_result = builder::run_build(
             &node_paths,
             &sync.repo_dir,
             &cfg.build_script,
             &cfg.install_args,
             &workspace_root,
+            pnpm_cmd.as_deref(),
+            lang,
+            sync.commit.as_deref(),
             &|phase: &str| {
                 // install → build 阶段切换：install 完成标记 done
                 if phase == "build" {
+                    build_stage.store(1, Ordering::Relaxed);
+                    // install 阶段成功完成 → 持久化标记
+                    if let Err(e) = repo_manager::mark_deps_installed(&workspace_root) {
+                        eprintln!("记录依赖安装标记失败（不影响运行）: {e:#}");
+                    }
                     send_status("install", "done", lang.detail_install_done().to_string());
                     send_status("build", "running", lang.detail_building().to_string());
                 }
             },
             &|line: String| send_log(line),
+            &|progress: Option<f64>, detail: Option<String>| {
+                let stage = if build_stage.load(Ordering::Relaxed) == 0 { "install" } else { "build" };
+                let _ = proxy.send_event(UserEvent::Progress {
+                    stage,
+                    progress,
+                    detail,
+                });
+            },
         );
 
         let built = build_result.map_err(|e| {
             send_status("build", "failed", format!("{e:#}"));
             e
         })?;
+        // 构建成功 → 持久化标记
+        if let Err(e) = repo_manager::mark_build_done(&workspace_root) {
+            eprintln!("记录构建完成标记失败（不影响运行）: {e:#}");
+        }
         send_status("build", "done", lang.detail_build_done().to_string());
         built
     };
@@ -294,8 +372,48 @@ fn run_bootstrap(
     if let Err(e) = repo_manager::mark_host_started(&workspace_root) {
         eprintln!("记录宿主启动标记失败（不影响运行）: {e:#}");
     }
-    let _ = proxy.send_event(UserEvent::HostReady(host.url));
+    let version_label = build_version_label(&sync, lang);
+    let _ = proxy.send_event(UserEvent::HostReady { url: host.url, version_label });
     Ok(())
+}
+
+/// 构造窗口标题版本标签：`<commit 短哈>(<dsh 版本号>)`。
+///
+/// commit 短哈取同步结果中远端 SHA 前 6 位（无 SHA 时回退到 `unknown`）；
+/// dsh 版本号从 `repo/package.json` 的 `version` 字段读取（读取失败时回退到 `?`）。
+fn build_version_label(sync: &repo_manager::SyncResult, _lang: Lang) -> String {
+    let short_sha = sync
+        .commit
+        .as_deref()
+        .filter(|s| s.len() >= 6)
+        .map(|s| &s[..6])
+        .unwrap_or("unknown");
+    let dsh_version = read_dsh_version(&sync.repo_dir).unwrap_or_else(|| "?".to_string());
+    format!("{short_sha}({dsh_version})")
+}
+
+/// 从仓库根 `package.json` 读取 `version` 字段。
+fn read_dsh_version(repo_dir: &Path) -> Option<String> {
+    let pkg_path = repo_dir.join("package.json");
+    let content = std::fs::read_to_string(&pkg_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    value.get("version")?.as_str().map(|s| s.to_string())
+}
+
+/// 将字节级下载进度转换为 `(Option<f64>, Option<String>)` 供 `UserEvent::Progress`。
+///
+/// 有总长时给出精确百分比与 MB 进度文案；无总长时给出不确定进度与已下载 MB。
+fn download_progress_detail(lang: Lang, written: u64, total: Option<u64>) -> (Option<f64>, Option<String>) {
+    let done_mb = written as f64 / 1_048_576.0;
+    match total {
+        Some(t) if t > 0 => {
+            let progress = Some((written as f64 / t as f64).clamp(0.0, 1.0));
+            let pct = (written * 100 / t) as u64;
+            let detail = lang.progress_download_pct(pct, done_mb, t as f64 / 1_048_576.0);
+            (progress, Some(detail))
+        }
+        _ => (None, Some(lang.progress_download_mb(done_mb))),
+    }
 }
 
 /// 生成同步结果的状态页文案。
@@ -308,5 +426,97 @@ fn sync_result_detail(sync: &repo_manager::SyncResult, lang: Lang) -> String {
             lang.detail_sync_updated_sha().replace("{}", &short)
         }
         (true, None) => lang.detail_sync_updated_fallback().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// 读取 dsh 版本号：正常 package.json → 返回 version 字段
+    #[test]
+    fn test_read_dsh_version_ok() {
+        let dir = std::env::temp_dir().join("dsh_version_test_ok");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name": "deepseek-harness", "version": "0.1.1-rc.2"}"#,
+        )
+        .unwrap();
+        assert_eq!(read_dsh_version(&dir), Some("0.1.1-rc.2".to_string()));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 读取 dsh 版本号：文件缺失 / 无 version 字段 / 无效 JSON → None
+    #[test]
+    fn test_read_dsh_version_missing() {
+        let dir = std::env::temp_dir().join("dsh_version_test_missing");
+        fs::create_dir_all(&dir).unwrap();
+        // 无 package.json
+        assert_eq!(read_dsh_version(&dir), None);
+        // 缺少 version 字段
+        fs::write(dir.join("package.json"), r#"{"name": "x"}"#).unwrap();
+        assert_eq!(read_dsh_version(&dir), None);
+        // 无效 JSON
+        fs::write(dir.join("package.json"), "not json").unwrap();
+        assert_eq!(read_dsh_version(&dir), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 版本标签格式：`<6位SHA>(<dsh版本>)`；无 SHA 时回退 `unknown`
+    #[test]
+    fn test_build_version_label() {
+        let dir = std::env::temp_dir().join("dsh_version_label_test");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("package.json"),
+            r#"{"version": "0.1.1-rc.2"}"#,
+        )
+        .unwrap();
+
+        let sync_with_sha = repo_manager::SyncResult {
+            updated: true,
+            repo_dir: dir.clone(),
+            commit: Some("0fc1de2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e".to_string()),
+        };
+        let label = build_version_label(&sync_with_sha, Lang::Zh);
+        assert_eq!(label, "0fc1de(0.1.1-rc.2)");
+
+        let sync_no_sha = repo_manager::SyncResult {
+            updated: false,
+            repo_dir: dir.clone(),
+            commit: None,
+        };
+        let label = build_version_label(&sync_no_sha, Lang::Zh);
+        assert_eq!(label, "unknown(0.1.1-rc.2)");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 下载进度转换：有总长 → 精确百分比；无总长 → 不确定进度
+    #[test]
+    fn test_download_progress_detail_with_total() {
+        let (progress, detail) = download_progress_detail(Lang::Zh, 50, Some(200));
+        assert_eq!(progress, Some(0.25));
+        assert!(detail.as_ref().unwrap().contains("25%"), "detail: {detail:?}");
+
+        // 完成
+        let (progress, _) = download_progress_detail(Lang::Zh, 200, Some(200));
+        assert_eq!(progress, Some(1.0));
+    }
+
+    #[test]
+    fn test_download_progress_detail_without_total() {
+        let (progress, detail) = download_progress_detail(Lang::Zh, 1_048_576, None);
+        assert!(progress.is_none(), "无总长应为不确定进度");
+        assert!(detail.as_ref().unwrap().contains("1.0 MB"), "detail: {detail:?}");
+    }
+
+    #[test]
+    fn test_download_progress_detail_zero_total() {
+        // total=0 视为无效，回退不确定
+        let (progress, _) = download_progress_detail(Lang::Zh, 100, Some(0));
+        assert!(progress.is_none());
     }
 }

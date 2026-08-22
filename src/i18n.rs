@@ -223,6 +223,70 @@ impl Lang {
             Lang::En => "Version matches, reusing existing build, skipping build",
         }
     }
+
+    /// 进度：仓库同步开始。
+    pub fn progress_sync_start(self) -> &'static str {
+        match self {
+            Lang::Zh => "开始同步...",
+            Lang::En => "Starting sync...",
+        }
+    }
+
+    /// 进度：仓库下载百分比（有总长）。
+    pub fn progress_download_pct(self, pct: u64, done_mb: f64, total_mb: f64) -> String {
+        match self {
+            Lang::Zh => format!("下载中 {pct}% （{done_mb:.1} MB / {total_mb:.1} MB）"),
+            Lang::En => format!("Downloading {pct}% ({done_mb:.1} MB / {total_mb:.1} MB)"),
+        }
+    }
+
+    /// 进度：仓库下载中（无总长）。
+    pub fn progress_download_mb(self, done_mb: f64) -> String {
+        match self {
+            Lang::Zh => format!("下载中 {done_mb:.1} MB ..."),
+            Lang::En => format!("Downloading {done_mb:.1} MB ..."),
+        }
+    }
+
+    /// 进度：正在解压仓库。
+    pub fn progress_extracting(self) -> &'static str {
+        match self {
+            Lang::Zh => "正在解压仓库...",
+            Lang::En => "Extracting repository...",
+        }
+    }
+
+    /// 进度：仓库同步完成。
+    pub fn progress_sync_done(self) -> &'static str {
+        match self {
+            Lang::Zh => "仓库同步完成",
+            Lang::En => "Repository synced",
+        }
+    }
+
+    /// 进度：安装依赖完成。
+    pub fn progress_install_done(self) -> &'static str {
+        match self {
+            Lang::Zh => "依赖安装完成",
+            Lang::En => "Dependencies installed",
+        }
+    }
+
+    /// 进度：构建完成。
+    pub fn progress_build_done(self) -> &'static str {
+        match self {
+            Lang::Zh => "构建完成",
+            Lang::En => "Build complete",
+        }
+    }
+
+    /// 进度：命令输出行数（install/build 阶段的活动进度提示）。
+    pub fn progress_lines(self, n: u64) -> String {
+        match self {
+            Lang::Zh => format!("（已输出 {n} 行）"),
+            Lang::En => format!("({n} lines output)"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -283,6 +347,25 @@ mod tests {
         assert!(Lang::En.detail_sync_cached().contains("Version matches"));
         assert!(Lang::Zh.detail_build_cached().contains("版本一致"));
         assert!(Lang::En.detail_build_cached().contains("Version matches"));
+    }
+
+    /// 进度文案取值正确（中英有别，数字插值正确）
+    #[test]
+    fn test_progress_texts() {
+        assert_eq!(Lang::Zh.progress_sync_start(), "开始同步...");
+        assert_eq!(Lang::En.progress_sync_start(), "Starting sync...");
+        assert_eq!(Lang::Zh.progress_extracting(), "正在解压仓库...");
+        assert_eq!(Lang::En.progress_extracting(), "Extracting repository...");
+
+        let zh_pct = Lang::Zh.progress_download_pct(35, 1.2, 3.4);
+        assert!(zh_pct.contains("35%"));
+        let en_pct = Lang::En.progress_download_pct(35, 1.2, 3.4);
+        assert!(en_pct.contains("35%"));
+        assert_ne!(zh_pct, en_pct);
+
+        assert!(Lang::Zh.progress_lines(3).contains("3"));
+        assert!(Lang::En.progress_lines(3).contains("3"));
+        assert_ne!(Lang::Zh.progress_lines(3), Lang::En.progress_lines(3));
     }
 
     /// 中英文文案互不相同

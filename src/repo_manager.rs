@@ -5,6 +5,8 @@
 //!
 //! ## 设计决策
 //! - 增量判定：远端 SHA == `state.last_commit` 且 `repo/` 存在 → 跳过下载。
+//! - 远端检查使用 10s 短超时：超时连不上远程时，若宿主曾成功运行过则直接复用
+//!   本地仓库启动宿主（离线快速启动），否则才回退重量级下载。
 //! - zip 顶层目录剥离：codeload zip 内是 `{repo}-{ref}/` 单顶层结构，解压时剥掉。
 //! - API 失败回退：网络/限流导致 API 查询失败时，直接全量重新下载，保证流程可用。
 
@@ -19,6 +21,43 @@ const FS_RETRIES: u32 = 6;
 /// 目录操作重试间隔基数（逐次翻倍：0.5s / 1s / 2s / 4s / 8s）
 const FS_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+/// 启动时检查远端更新的总超时：10s 内连不上远程则判定离线，
+/// 曾成功运行过时直接复用本地宿主，避免长时间阻塞启动。
+const REMOTE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 远端检查错误分类：区分「网络不可达/超时」与「服务可达但出错」。
+#[derive(Debug)]
+enum RemoteError {
+    /// 连不上/超时（可据此判定离线）
+    Unreachable(String),
+    /// 服务可达但返回非 2xx（如分支不存在 404、限流 403）
+    HttpStatus(u16),
+    /// 其他（解析、客户端构造等）
+    Other(anyhow::Error),
+}
+
+impl From<crate::http_util::HttpError> for RemoteError {
+    fn from(e: crate::http_util::HttpError) -> Self {
+        match e {
+            crate::http_util::HttpError::Unreachable(s) => RemoteError::Unreachable(s),
+            crate::http_util::HttpError::HttpStatus(s) => RemoteError::HttpStatus(s),
+            crate::http_util::HttpError::Other(e) => RemoteError::Other(e),
+        }
+    }
+}
+
+impl std::fmt::Display for RemoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RemoteError::Unreachable(e) => write!(f, "无法连接远程仓库: {e}"),
+            RemoteError::HttpStatus(s) => write!(f, "远程仓库返回状态码 {s}"),
+            RemoteError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for RemoteError {}
+
 /// 解析后的仓库坐标
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoInfo {
@@ -29,6 +68,9 @@ pub struct RepoInfo {
 }
 
 /// 持久化状态（`<root>/state.json`）
+///
+/// 记录容器各阶段完成度，使二次启动能跳过已完成的耗时步骤（仓库下载、依赖安装、
+/// 构建产物），仅当远端有新版本时才重新获取。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SyncState {
     /// 上次同步成功时的远端分支 commit SHA（40 位十六进制）
@@ -37,9 +79,19 @@ pub struct SyncState {
     /// 上次使用的 Node 版本（配置覆盖后用于感知版本变化）
     #[serde(default)]
     pub node_version: String,
-    /// 宿主是否曾成功启动过（`dsh web` 就绪）。仅置 true 后二次启动才走快速路径跳过下载。
+    /// 宿主是否曾成功启动过（`dsh web` 就绪）
     #[serde(default)]
     pub host_started: bool,
+    /// 仓库同步成功完成过（即使后续 install/build 失败，二次启动也跳过仓库下载，
+    /// 仅当远端 commit 不一致时才重新获取）
+    #[serde(default)]
+    pub repo_synced: bool,
+    /// 依赖安装成功完成过（二次启动可跳过 install，仅当仓库更新时需重装）
+    #[serde(default)]
+    pub deps_installed: bool,
+    /// 构建产物就绪（二次启动可跳过 build，仅当仓库更新时需重构）
+    #[serde(default)]
+    pub build_done: bool,
 }
 
 /// 同步结果
@@ -158,18 +210,59 @@ pub fn mark_host_started(workspace_root: &Path) -> anyhow::Result<()> {
     save_state(workspace_root, &state)
 }
 
-/// 查询远端分支最新 commit SHA。
+/// 标记依赖安装成功完成。
+///
+/// 供 `run_bootstrap` 在 install 成功后调用，使二次启动可跳过依赖安装。
+///
+/// # Arguments
+/// * `workspace_root` - 运行时工作目录
+///
+/// # Errors
+/// 序列化或写入失败
+pub fn mark_deps_installed(workspace_root: &Path) -> anyhow::Result<()> {
+    let mut state = load_state(workspace_root);
+    if state.deps_installed {
+        return Ok(());
+    }
+    state.deps_installed = true;
+    save_state(workspace_root, &state)
+}
+
+/// 标记构建产物就绪。
+///
+/// 供 `run_bootstrap` 在 build 成功后调用，使二次启动可跳过构建。
+///
+/// # Arguments
+/// * `workspace_root` - 运行时工作目录
+///
+/// # Errors
+/// 序列化或写入失败
+pub fn mark_build_done(workspace_root: &Path) -> anyhow::Result<()> {
+    let mut state = load_state(workspace_root);
+    if state.build_done {
+        return Ok(());
+    }
+    state.build_done = true;
+    save_state(workspace_root, &state)
+}
+
+/// 查询远端分支最新 commit SHA（10s 短超时，用于启动检查）。
 ///
 /// # Arguments
 /// * `info` - 仓库坐标
 /// * `branch` - 分支名
 ///
 /// # Returns
-/// 40 位 commit SHA；API 请求/解析失败返回 `Err`
-fn fetch_remote_commit(info: &RepoInfo, branch: &str) -> anyhow::Result<String> {
-    let resp: CommitResponse = crate::http_util::get_json(&commits_api_url(info, branch))?;
+/// 40 位 commit SHA；超时/连接失败返回 [`RemoteError::Unreachable`]，
+/// 非 2xx 返回 [`RemoteError::HttpStatus`]
+fn fetch_remote_commit(info: &RepoInfo, branch: &str) -> Result<String, RemoteError> {
+    let resp: CommitResponse =
+        crate::http_util::get_json_with_timeout(&commits_api_url(info, branch), REMOTE_CHECK_TIMEOUT)?;
     if resp.sha.len() != 40 {
-        return Err(anyhow::anyhow!("API 返回的 SHA 长度异常: {}", resp.sha));
+        return Err(RemoteError::Other(anyhow::anyhow!(
+            "API 返回的 SHA 长度异常: {}",
+            resp.sha
+        )));
     }
     Ok(resp.sha)
 }
@@ -188,13 +281,15 @@ struct CommitResponse {
 ///
 /// # Returns
 /// 默认分支名（如 `master` / `main`）；API 失败返回 `Err`
-fn fetch_default_branch(info: &RepoInfo) -> anyhow::Result<String> {
-    let resp: RepoDetailResponse = crate::http_util::get_json(&format!(
-        "https://api.github.com/repos/{}/{}",
-        info.owner, info.repo
-    ))?;
+fn fetch_default_branch(info: &RepoInfo) -> Result<String, RemoteError> {
+    let resp: RepoDetailResponse = crate::http_util::get_json_with_timeout(
+        &format!("https://api.github.com/repos/{}/{}", info.owner, info.repo),
+        REMOTE_CHECK_TIMEOUT,
+    )?;
     if resp.default_branch.is_empty() {
-        return Err(anyhow::anyhow!("API 返回的 default_branch 为空"));
+        return Err(RemoteError::Other(anyhow::anyhow!(
+            "API 返回的 default_branch 为空"
+        )));
     }
     Ok(resp.default_branch)
 }
@@ -283,22 +378,51 @@ fn remove_dir_all_with_retry(dir: &Path) -> anyhow::Result<()> {
     ))
 }
 
+/// 同步进度回调类型：`(百分比 0.0~1.0 或 None 表示不确定, 展示文案)`。
+///
+/// 仓库 zip 下载期间以字节进度回调；解压等无法精确测量的阶段传 `None`。
+/// 须 `Send + Sync`，以便在子进程管道线程内安全调用。
+pub type SyncProgress<'a> = dyn Fn(Option<f64>, Option<String>) + Send + Sync + 'a;
+
 /// 下载 codeload zip 并解压重建 `repo/`（剥离 zip 顶层目录）。
 ///
 /// # Arguments
 /// * `info` - 仓库坐标
 /// * `branch` - 分支名
 /// * `repo_dir` - 目标目录 `<root>/repo/`
+/// * `lang` - 展示文案语言
+/// * `on_progress` - 下载进度回调（字节 → 百分比）
 ///
 /// # Errors
 /// - 下载失败
 /// - 清空或解压失败
-fn rebuild_repo_from_zip(info: &RepoInfo, branch: &str, repo_dir: &Path) -> anyhow::Result<()> {
+fn rebuild_repo_from_zip(
+    info: &RepoInfo,
+    branch: &str,
+    repo_dir: &Path,
+    lang: crate::i18n::Lang,
+    on_progress: &SyncProgress<'_>,
+) -> anyhow::Result<()> {
     let zip_url = codeload_zip_url(info, branch);
 
     // zip 暂存到 repo/ 同级的临时文件
     let zip_path = repo_dir.with_extension("zip.tmp");
-    crate::http_util::download_file(&zip_url, &zip_path)?;
+    crate::http_util::download_file(
+        &zip_url,
+        &zip_path,
+        Some(&move |done, total| {
+            let frac = total.filter(|t| *t > 0).map(|t| done as f64 / t as f64);
+            let detail = match (done, total) {
+                (_, Some(t)) if t > 0 => lang.progress_download_pct(
+                    (done as f64 / t as f64 * 100.0) as u64,
+                    done as f64 / 1024.0 / 1024.0,
+                    t as f64 / 1024.0 / 1024.0,
+                ),
+                _ => lang.progress_download_mb(done as f64 / 1024.0 / 1024.0),
+            };
+            on_progress(frac, Some(detail));
+        }),
+    )?;
 
     // 先清空旧 repo/（避免新旧文件混杂），再解压到父目录后剥离顶层
     let staging_dir = repo_dir.with_extension("extract.tmp");
@@ -306,6 +430,7 @@ fn rebuild_repo_from_zip(info: &RepoInfo, branch: &str, repo_dir: &Path) -> anyh
     std::fs::create_dir_all(&staging_dir)
         .map_err(|e| anyhow::anyhow!("创建临时目录 {} 失败: {e}", staging_dir.display()))?;
 
+    on_progress(None, Some(lang.progress_extracting().to_string()));
     let result = (|| {
         crate::node_manager::extract_zip(&zip_path, &staging_dir)?;
 
@@ -342,60 +467,77 @@ fn rebuild_repo_from_zip(info: &RepoInfo, branch: &str, repo_dir: &Path) -> anyh
 /// * `branch` - 分支名
 /// * `node_version` - 当前配置的 Node 版本（写入 state）
 /// * `on_status` - 阶段状态回调（用于状态页/日志）
+/// * `on_progress` - 进度回调（zip 下载字节百分比 / 解压等阶段文案）
 ///
 /// # Returns
-/// [`SyncResult`]：`updated=true` 表示本次重建了 repo/；`commit=None` 表示 API 失败走了回退
+/// [`SyncResult`]：`updated=true` 表示本次重建了 repo/；`commit=None` 表示
+/// 远端检查失败走了复用或回退
 ///
 /// # Errors
 /// - 仓库地址无法解析
-/// - 需要下载时下载/解压失败（API 失败本身不算错误，走回退）
+/// - 需要下载时下载/解压失败（远端检查失败本身不算错误，走复用或回退）
 pub fn sync_repo(
     workspace_root: &Path,
     repo_url: &str,
     branch: &str,
     node_version: &str,
+    lang: crate::i18n::Lang,
     on_status: &dyn Fn(String),
+    on_progress: &SyncProgress<'_>,
 ) -> anyhow::Result<SyncResult> {
     let info = parse_repo_url(repo_url)?;
     let repo_dir = workspace_root.join("repo");
+    let state = load_state(workspace_root);
 
-    // 尝试 API 查询远端 commit；分支不存在时回退仓库默认分支重试；仍失败则全量下载
+    // 远端检查（10s 短超时）：超时/连不上视为离线
     let mut effective_branch = branch.to_string();
-    let mut remote_commit = fetch_remote_commit(&info, &effective_branch);
-    if remote_commit.is_err() {
-        // 配置分支查询失败：常见原因是分支名写错（如 main vs master）
-        // → 查询仓库 default_branch 并用其重试
-        match fetch_default_branch(&info) {
-            Ok(default_branch) if default_branch != effective_branch => {
-                on_status(format!(
-                    "分支 {effective_branch} 查询失败，回退仓库默认分支 {default_branch}"
-                ));
-                effective_branch = default_branch;
-                remote_commit = fetch_remote_commit(&info, &effective_branch);
-            }
-            Ok(_) => {}
-            Err(db_err) => {
-                remote_commit = Err(db_err);
-            }
+    let remote_result = fetch_remote_commit(&info, &effective_branch);
+
+    // 离线快速路径：连不上远程仓库，但仓库曾同步成功且本地 repo 存在
+    // → 直接复用本地仓库，不阻塞启动流程（即使上次 build 失败也不重新下载）
+    if let Err(RemoteError::Unreachable(_)) = &remote_result {
+        if state.repo_synced && repo_dir.exists() {
+            on_status("检查远端更新未响应（10s 超时），复用本地仓库直接启动".to_string());
+            return Ok(SyncResult {
+                updated: false,
+                commit: None,
+                repo_dir,
+            });
         }
     }
 
-    let remote_commit = match remote_commit {
+    // 配置分支查询失败：常见原因是分支名写错（如 main vs master）
+    // → 查询仓库 default_branch 并用其重试；仍失败则全量下载
+    let remote_commit: Option<String> = match remote_result {
         Ok(sha) => Some(sha),
         Err(e) => {
-            on_status(format!("GitHub API 查询失败（{e}），回退为直接重新下载"));
-            None
+            let retried = match fetch_default_branch(&info) {
+                Ok(default_branch) if default_branch != effective_branch => {
+                    on_status(format!(
+                        "分支 {effective_branch} 查询失败，回退仓库默认分支 {default_branch}"
+                    ));
+                    effective_branch = default_branch;
+                    fetch_remote_commit(&info, &effective_branch).ok()
+                }
+                Ok(_) => None,
+                Err(_) => None,
+            };
+            match retried {
+                Some(sha) => Some(sha),
+                None => {
+                    on_status(format!("GitHub API 查询失败（{e}），回退为直接重新下载"));
+                    None
+                }
+            }
         }
     };
 
-    let state = load_state(workspace_root);
-
-    // 快速路径：宿主曾成功启动 + 远端 commit 一致 + repo/ 存在 → 跳过下载解压，
-    // 直接复用本地 repo 启动宿主（轻量检查后跳过，避免重复下载重建）
+    // 联机快速路径：远端 commit 一致 + 仓库曾同步成功 + repo/ 存在
+    // → 跳过下载解压，直接复用本地 repo（即使上次 install/build 失败也不重新下载）
     if let Some(sha) = remote_commit.as_ref() {
-        if *sha == state.last_commit && state.host_started && repo_dir.exists() {
+        if *sha == state.last_commit && state.repo_synced && repo_dir.exists() {
             on_status(format!(
-                "版本一致（commit {sha}），复用本地仓库直接启动宿主"
+                "版本一致（commit {sha}），复用本地仓库"
             ));
             return Ok(SyncResult {
                 updated: false,
@@ -405,19 +547,24 @@ pub fn sync_repo(
         }
     }
 
-    // 场景：首次同步 或 有更新 或 API 失败回退 → 下载 zip 重建 repo/
+    // 场景：首次同步 或 有更新 或 远端检查失败回退 → 下载 zip 重建 repo/
     on_status(format!(
         "正在同步仓库 {}/{}（分支 {effective_branch}）...",
         info.owner, info.repo
     ));
-    rebuild_repo_from_zip(&info, &effective_branch, &repo_dir)?;
+    on_progress(Some(0.0), Some(lang.progress_sync_start().to_string()));
+    rebuild_repo_from_zip(&info, &effective_branch, &repo_dir, lang, on_progress)?;
+    on_progress(Some(1.0), Some(lang.progress_sync_done().to_string()));
     on_status("仓库同步完成".to_string());
 
-    // 更新并持久化 state
+    // 更新并持久化 state：仓库同步成功，重置后续阶段标记（依赖/构建需重做）
     let new_state = SyncState {
         last_commit: remote_commit.clone().unwrap_or_default(),
         node_version: node_version.to_string(),
-        host_started: false,
+        host_started: state.host_started, // 保留宿主启动标记
+        repo_synced: true,                // 仓库同步完成
+        deps_installed: false,            // 仓库更新 → 依赖需重装
+        build_done: false,                // 仓库更新 → 构建需重做
     };
     save_state(workspace_root, &new_state)?;
 
@@ -499,7 +646,7 @@ mod tests {
         let state = SyncState {
             last_commit: "a".repeat(40),
             node_version: "24.19.0".into(),
-            host_started: false,
+            ..Default::default()
         };
         save_state(&dir, &state).unwrap();
         assert_eq!(load_state(&dir), state);
@@ -529,6 +676,9 @@ mod tests {
         assert_eq!(state.last_commit, "a".repeat(40));
         assert_eq!(state.node_version, "24.19.0");
         assert!(!state.host_started, "旧格式缺省 host_started 应为 false");
+        assert!(!state.repo_synced, "旧格式缺省 repo_synced 应为 false");
+        assert!(!state.deps_installed, "旧格式缺省 deps_installed 应为 false");
+        assert!(!state.build_done, "旧格式缺省 build_done 应为 false");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -543,7 +693,7 @@ mod tests {
         let state = SyncState {
             last_commit: "b".repeat(40),
             node_version: "24.19.0".into(),
-            host_started: false,
+            ..Default::default()
         };
         save_state(&dir, &state).unwrap();
 
@@ -571,6 +721,44 @@ mod tests {
         let loaded = load_state(&dir);
         assert!(loaded.host_started);
         assert_eq!(loaded.last_commit, "", "无既有记录时 last_commit 为空");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// mark_deps_installed / mark_build_done：置位后可加载，且保留其他字段
+    #[test]
+    fn test_mark_deps_and_build() {
+        let dir = std::env::temp_dir().join("dsh_repo_test_mark_deps_build");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 先写入基础 state
+        let state = SyncState {
+            last_commit: "c".repeat(40),
+            node_version: "24.19.0".into(),
+            repo_synced: true,
+            ..Default::default()
+        };
+        save_state(&dir, &state).unwrap();
+
+        // 标记依赖安装完成
+        mark_deps_installed(&dir).unwrap();
+        let loaded = load_state(&dir);
+        assert!(loaded.deps_installed);
+        assert!(loaded.repo_synced, "应保留 repo_synced");
+        assert_eq!(loaded.last_commit, "c".repeat(40));
+
+        // 标记构建完成
+        mark_build_done(&dir).unwrap();
+        let loaded = load_state(&dir);
+        assert!(loaded.build_done);
+        assert!(loaded.deps_installed, "应保留 deps_installed");
+
+        // 幂等
+        mark_deps_installed(&dir).unwrap();
+        mark_build_done(&dir).unwrap();
+        assert!(load_state(&dir).deps_installed);
+        assert!(load_state(&dir).build_done);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

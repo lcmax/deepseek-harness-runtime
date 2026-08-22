@@ -19,3 +19,8 @@ root = ".runtime"
 script = "build"
 # 附加到 npm install 的额外参数，例如 ["--registry=https://registry.npmmirror.com"]
 install_args = []
+
+[pnpm]
+# 指定的 pnpm 版本（如 "11.7.0"），在容器内托管该版本 pnpm 运行；
+# 留空或省略时按仓库 packageManager/corepack 自动选择
+version = "11.7.0"
